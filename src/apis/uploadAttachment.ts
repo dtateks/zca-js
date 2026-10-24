@@ -129,6 +129,10 @@ const urlType = {
 
 /** Chunk requests in flight at once: each holds one chunk in memory, so a large file never does. */
 const CHUNK_REQUESTS_IN_FLIGHT = 4;
+/** The failure when the socket closes before Zalo confirms an upload: a closed socket never delivers file_done. */
+const SOCKET_CLOSED = "The connection closed before Zalo confirmed the upload";
+/** Zalo confirms a video or file over the listener's socket; an image is confirmed by its own reply. */
+const needsSocket = (fileType: AttachmentData["fileType"]) => fileType == "video" || fileType == "others";
 
 export const uploadAttachmentFactory = apiFactory()((api, ctx, utils) => {
     const serviceURL = `${api.zpwServiceMap.file[0]}/api`;
@@ -284,6 +288,7 @@ export const uploadAttachmentFactory = apiFactory()((api, ctx, utils) => {
             let failed = false;
             const sendChunk = async ({ atmIndex, index }: { atmIndex: number; index: number }) => {
                 const data = attachmentsData[atmIndex];
+                if (needsSocket(data.fileType) && ctx.socketOpen === false) throw new ZaloApiError(SOCKET_CLOSED);
                 const encryptedParams = utils.encodeAES(JSON.stringify({ ...data.params, chunkId: index + 1 }));
                 if (!encryptedParams) throw new ZaloApiError("Failed to encrypt message");
 
@@ -313,19 +318,26 @@ export const uploadAttachmentFactory = apiFactory()((api, ctx, utils) => {
                 const resData = await resolveResponse<RawResponse>(ctx, response);
 
                 if (resData && resData.fileId != "-1" && resData.photoId != "-1")
-                    await new Promise<void>((resolve) => {
-                        if (data.fileType == "video" || data.fileType == "others") {
+                    await new Promise<void>((resolve, reject) => {
+                        if (needsSocket(data.fileType)) {
+                            if (ctx.socketOpen === false) return reject(new ZaloApiError(SOCKET_CLOSED));
+
                             const uploadCallback: UploadCallback = async (wsData) => {
-                                const result = {
-                                    fileType: data.fileType,
-                                    ...resData,
-                                    ...wsData,
-                                    totalSize: data.fileData.totalSize,
-                                    fileName: data.fileData.fileName,
-                                    checksum: (await getMd5LargeFileObject(data.source, data.fileData.totalSize)).data,
-                                };
-                                results[atmIndex] = result;
-                                resolve();
+                                if ("closed" in wsData) return reject(new ZaloApiError(SOCKET_CLOSED));
+                                try {
+                                    const result = {
+                                        fileType: data.fileType,
+                                        ...resData,
+                                        ...wsData,
+                                        totalSize: data.fileData.totalSize,
+                                        fileName: data.fileData.fileName,
+                                        checksum: (await getMd5LargeFileObject(data.source, data.fileData.totalSize)).data,
+                                    };
+                                    results[atmIndex] = result;
+                                    resolve();
+                                } catch (error) {
+                                    reject(error);
+                                }
                             };
 
                             ctx.uploadCallbacks.set(resData.fileId!.toString(), uploadCallback);
